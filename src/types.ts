@@ -77,13 +77,15 @@ export interface AgentConfig {
 }
 
 export interface ParsedSource {
-  type: 'github' | 'gitlab' | 'git' | 'local' | 'well-known';
+  type: 'github' | 'gitlab' | 'git' | 'local' | 'well-known' | 'notion';
   url: string;
   subpath?: string;
   localPath?: string;
   ref?: string;
   /** Skill name extracted from @skill syntax (e.g., owner/repo@skill-name) */
   skillFilter?: string;
+  /** Notion page ID (32-char hex) for notion type sources */
+  pageId?: string;
 }
 
 /**

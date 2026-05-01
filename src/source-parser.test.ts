@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { parseSource } from './source-parser.js';
+import { extractNotionPageId, isNotionUrl } from './notion.js';
 
 describe('source-parser', () => {
   describe('GitLab Custom Domains & Subgroups', () => {
@@ -126,6 +127,126 @@ describe('source-parser', () => {
         url: 'git@github.com:owner/repo.git',
         ref: 'feature/install',
       });
+    });
+  });
+
+  // ── Notion page URL support ─────────────────────────────────────────────────
+  describe('Notion page URLs', () => {
+    const TEST_UUID = '353efdeead0580cc9ed9d3ee9b4357b5';
+
+    it('detects notion.so URLs', () => {
+      expect(
+        isNotionUrl('https://notion.so/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
+      ).toBe(true);
+    });
+
+    it('detects notion.com URLs', () => {
+      expect(
+        isNotionUrl('https://notion.com/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
+      ).toBe(true);
+    });
+
+    it('detects www.notion.so URLs', () => {
+      expect(
+        isNotionUrl('https://www.notion.so/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
+      ).toBe(true);
+    });
+
+    it('detects app.notion.com URLs', () => {
+      expect(
+        isNotionUrl('https://app.notion.com/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
+      ).toBe(true);
+    });
+
+    it('does not match other notion subdomains', () => {
+      expect(
+        isNotionUrl('https://api.notion.so/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
+      ).toBe(false);
+      expect(
+        isNotionUrl('https://www.notion.com/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
+      ).toBe(false);
+    });
+
+    it('does not match non-Notion URLs', () => {
+      expect(isNotionUrl('https://github.com/owner/repo')).toBe(false);
+      expect(isNotionUrl('https://example.com/page')).toBe(false);
+      expect(isNotionUrl('notion.so/no-protocol')).toBe(false);
+    });
+
+    it('extracts UUID from notion.so URL with slug', () => {
+      const url = `https://notion.so/notion/notion-cli-${TEST_UUID}?source=copy_link`;
+      expect(extractNotionPageId(url)).toBe(TEST_UUID);
+    });
+
+    it('extracts UUID from notion.com URL with slug', () => {
+      const url = `https://notion.com/workspace/My-Page-${TEST_UUID}`;
+      expect(extractNotionPageId(url)).toBe(TEST_UUID);
+    });
+
+    it('extracts UUID from bare notion.so URL (no slug)', () => {
+      const url = `https://notion.so/${TEST_UUID}`;
+      expect(extractNotionPageId(url)).toBe(TEST_UUID);
+    });
+
+    it('extracts and normalises dashed UUID format', () => {
+      // Standard 8-4-4-4-12 dashed UUID
+      const dashedId = '353efde e-ad05-80e4-a2b3-ef639a09bffc'.replace(/ /g, '');
+      const url = `https://notion.so/workspace/${dashedId}`;
+      const expected = dashedId.replace(/-/g, '').toLowerCase();
+      expect(extractNotionPageId(url)).toBe(expected);
+    });
+
+    it('strips query params when extracting UUID', () => {
+      const url = `https://notion.so/space/Page-${TEST_UUID}?source=copy_link&foo=bar`;
+      expect(extractNotionPageId(url)).toBe(TEST_UUID);
+    });
+
+    it('strips fragment when extracting UUID', () => {
+      const url = `https://notion.so/space/Page-${TEST_UUID}#some-section`;
+      expect(extractNotionPageId(url)).toBe(TEST_UUID);
+    });
+
+    it('returns null for Notion URL without a UUID', () => {
+      expect(extractNotionPageId('https://notion.so/workspace/no-uuid-here')).toBeNull();
+      expect(extractNotionPageId('https://notion.so/')).toBeNull();
+    });
+
+    it('returns null for non-Notion URLs', () => {
+      expect(extractNotionPageId('https://github.com/owner/repo')).toBeNull();
+    });
+
+    it('parseSource returns notion type for notion.so URL', () => {
+      const url = `https://notion.so/notion/notion-cli-${TEST_UUID}?source=copy_link`;
+      const result = parseSource(url);
+      expect(result.type).toBe('notion');
+      expect(result.url).toBe(url);
+      expect(result.pageId).toBe(TEST_UUID);
+    });
+
+    it('parseSource returns notion type for notion.com URL', () => {
+      const url = `https://notion.com/workspace/My-Page-${TEST_UUID}`;
+      const result = parseSource(url);
+      expect(result.type).toBe('notion');
+      expect(result.pageId).toBe(TEST_UUID);
+    });
+
+    it('parseSource does NOT return well-known for notion.so URLs', () => {
+      const url = `https://notion.so/notion/Page-${TEST_UUID}`;
+      const result = parseSource(url);
+      expect(result.type).not.toBe('well-known');
+    });
+
+    it('parseSource returns notion type for www.notion.so URL', () => {
+      const url = `https://www.notion.so/workspace/Page-${TEST_UUID}`;
+      const result = parseSource(url);
+      expect(result.type).toBe('notion');
+      expect(result).toHaveProperty('pageId', TEST_UUID);
+    });
+
+    it('parseSource does NOT return well-known for www.notion.so URLs', () => {
+      const url = `https://www.notion.so/workspace/Page-${TEST_UUID}`;
+      const result = parseSource(url);
+      expect(result.type).not.toBe('well-known');
     });
   });
 });

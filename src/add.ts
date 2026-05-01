@@ -1,8 +1,9 @@
 import * as p from '@clack/prompts';
 import pc from 'picocolors';
 import { existsSync } from 'fs';
-import { homedir } from 'os';
+import { homedir, tmpdir } from 'os';
 import { sep, join, dirname } from 'path';
+import { mkdtemp, writeFile } from 'fs/promises';
 import { parseSource, getOwnerRepo, parseOwnerRepo, isRepoPrivate } from './source-parser.ts';
 import { stripTerminalEscapes } from './sanitize.ts';
 import { searchMultiselect } from './prompts/search-multiselect.ts';
@@ -23,13 +24,14 @@ async function isSourcePrivate(source: string): Promise<boolean | null> {
   return isRepoPrivate(ownerRepo.owner, ownerRepo.repo);
 }
 import { cloneRepo, cleanupTempDir, GitCloneError } from './git.ts';
-import { discoverSkills, getSkillDisplayName, filterSkills } from './skills.ts';
+import { discoverSkills, getSkillDisplayName, filterSkills, parseSkillMd } from './skills.ts';
 import {
   installSkillForAgent,
   installBlobSkillForAgent,
   isSkillInstalled,
   getCanonicalPath,
   installWellKnownSkillForAgent,
+  sanitizeName,
   type InstallMode,
 } from './installer.ts';
 import {
@@ -65,6 +67,7 @@ import {
   type BlobSkill,
   type BlobInstallResult,
 } from './blob.ts';
+import { isNtnInstalled, fetchNotionPageMarkdown } from './notion.ts';
 import packageJson from '../package.json' with { type: 'json' };
 export function initTelemetry(version: string): void {
   setVersion(version);
@@ -429,6 +432,111 @@ export interface AddOptions {
 }
 
 /**
+ * Resolve target agents and installation scope from options and interactive
+ * prompts. Shared across all skill source handlers.
+ *
+ * @param onCancel - called before process.exit when the user cancels or an
+ *   error occurs, so callers can clean up temp directories.
+ */
+async function resolveAgentsAndScope(
+  options: AddOptions,
+  spinner: ReturnType<typeof p.spinner>,
+  onCancel: () => Promise<void> = async () => {}
+): Promise<{ targetAgents: AgentType[]; installGlobally: boolean }> {
+  let targetAgents: AgentType[];
+  const validAgents = Object.keys(agents);
+
+  if (options.agent?.includes('*')) {
+    targetAgents = validAgents as AgentType[];
+    p.log.info(`Installing to all ${targetAgents.length} agents`);
+  } else if (options.agent && options.agent.length > 0) {
+    const invalidAgents = options.agent.filter((a) => !validAgents.includes(a));
+    if (invalidAgents.length > 0) {
+      p.log.error(`Invalid agents: ${invalidAgents.join(', ')}`);
+      p.log.info(`Valid agents: ${validAgents.join(', ')}`);
+      await onCancel();
+      process.exit(1);
+    }
+    targetAgents = options.agent as AgentType[];
+  } else {
+    spinner.start('Loading agents...');
+    const installedAgents = await detectInstalledAgents();
+    const totalAgents = Object.keys(agents).length;
+    spinner.stop(`${totalAgents} agents`);
+
+    if (installedAgents.length === 0) {
+      if (options.yes) {
+        targetAgents = validAgents as AgentType[];
+        p.log.info('Installing to all agents');
+      } else {
+        p.log.info('Select agents to install skills to');
+        const allAgentChoices = Object.entries(agents).map(([key, config]) => ({
+          value: key as AgentType,
+          label: config.displayName,
+        }));
+        const selected = await promptForAgents(
+          'Which agents do you want to install to?',
+          allAgentChoices
+        );
+        if (p.isCancel(selected)) {
+          p.cancel('Installation cancelled');
+          await onCancel();
+          process.exit(0);
+        }
+        targetAgents = selected as AgentType[];
+      }
+    } else if (installedAgents.length === 1 || options.yes) {
+      targetAgents = ensureUniversalAgents(installedAgents);
+      if (installedAgents.length === 1) {
+        const firstAgent = installedAgents[0]!;
+        p.log.info(`Installing to: ${pc.cyan(agents[firstAgent].displayName)}`);
+      } else {
+        p.log.info(
+          `Installing to: ${installedAgents.map((a) => pc.cyan(agents[a].displayName)).join(', ')}`
+        );
+      }
+    } else {
+      const selected = await selectAgentsInteractive({ global: options.global });
+      if (p.isCancel(selected)) {
+        p.cancel('Installation cancelled');
+        await onCancel();
+        process.exit(0);
+      }
+      targetAgents = selected as AgentType[];
+    }
+  }
+
+  let installGlobally = options.global ?? false;
+  const supportsGlobal = targetAgents.some((a) => agents[a].globalSkillsDir !== undefined);
+
+  if (options.global === undefined && !options.yes && supportsGlobal) {
+    const scope = await p.select({
+      message: 'Installation scope',
+      options: [
+        {
+          value: false,
+          label: 'Project',
+          hint: 'Install in current directory (committed with your project)',
+        },
+        {
+          value: true,
+          label: 'Global',
+          hint: 'Install in home directory (available across all projects)',
+        },
+      ],
+    });
+    if (p.isCancel(scope)) {
+      p.cancel('Installation cancelled');
+      await onCancel();
+      process.exit(0);
+    }
+    installGlobally = scope as boolean;
+  }
+
+  return { targetAgents, installGlobally };
+}
+
+/**
  * Handle skills from a well-known endpoint (RFC 8615).
  * Discovers skills from /.well-known/agent-skills/index.json (preferred)
  * or /.well-known/skills/index.json (legacy fallback).
@@ -534,106 +642,7 @@ async function handleWellKnownSkills(
   }
 
   // Detect agents
-  let targetAgents: AgentType[];
-  const validAgents = Object.keys(agents);
-
-  if (options.agent?.includes('*')) {
-    // --agent '*' selects all agents
-    targetAgents = validAgents as AgentType[];
-    p.log.info(`Installing to all ${targetAgents.length} agents`);
-  } else if (options.agent && options.agent.length > 0) {
-    const invalidAgents = options.agent.filter((a) => !validAgents.includes(a));
-
-    if (invalidAgents.length > 0) {
-      p.log.error(`Invalid agents: ${invalidAgents.join(', ')}`);
-      p.log.info(`Valid agents: ${validAgents.join(', ')}`);
-      process.exit(1);
-    }
-
-    targetAgents = options.agent as AgentType[];
-  } else {
-    spinner.start('Loading agents...');
-    const installedAgents = await detectInstalledAgents();
-    const totalAgents = Object.keys(agents).length;
-    spinner.stop(`${totalAgents} agents`);
-
-    if (installedAgents.length === 0) {
-      if (options.yes) {
-        targetAgents = validAgents as AgentType[];
-        p.log.info('Installing to all agents');
-      } else {
-        p.log.info('Select agents to install skills to');
-
-        const allAgentChoices = Object.entries(agents).map(([key, config]) => ({
-          value: key as AgentType,
-          label: config.displayName,
-        }));
-
-        // Use helper to prompt with search
-        const selected = await promptForAgents(
-          'Which agents do you want to install to?',
-          allAgentChoices
-        );
-
-        if (p.isCancel(selected)) {
-          p.cancel('Installation cancelled');
-          process.exit(0);
-        }
-
-        targetAgents = selected as AgentType[];
-      }
-    } else if (installedAgents.length === 1 || options.yes) {
-      // Auto-select detected agents + ensure universal agents are included
-      targetAgents = ensureUniversalAgents(installedAgents);
-      if (installedAgents.length === 1) {
-        const firstAgent = installedAgents[0]!;
-        p.log.info(`Installing to: ${pc.cyan(agents[firstAgent].displayName)}`);
-      } else {
-        p.log.info(
-          `Installing to: ${installedAgents.map((a) => pc.cyan(agents[a].displayName)).join(', ')}`
-        );
-      }
-    } else {
-      const selected = await selectAgentsInteractive({ global: options.global });
-
-      if (p.isCancel(selected)) {
-        p.cancel('Installation cancelled');
-        process.exit(0);
-      }
-
-      targetAgents = selected as AgentType[];
-    }
-  }
-
-  let installGlobally = options.global ?? false;
-
-  // Check if any selected agents support global installation
-  const supportsGlobal = targetAgents.some((a) => agents[a].globalSkillsDir !== undefined);
-
-  if (options.global === undefined && !options.yes && supportsGlobal) {
-    const scope = await p.select({
-      message: 'Installation scope',
-      options: [
-        {
-          value: false,
-          label: 'Project',
-          hint: 'Install in current directory (committed with your project)',
-        },
-        {
-          value: true,
-          label: 'Global',
-          hint: 'Install in home directory (available across all projects)',
-        },
-      ],
-    });
-
-    if (p.isCancel(scope)) {
-      p.cancel('Installation cancelled');
-      process.exit(0);
-    }
-
-    installGlobally = scope as boolean;
-  }
+  const { targetAgents, installGlobally } = await resolveAgentsAndScope(options, spinner);
 
   // Determine install mode (symlink vs copy)
   let installMode: InstallMode = options.copy ? 'copy' : 'symlink';
@@ -713,15 +722,6 @@ async function handleWellKnownSkills(
 
   console.log();
   p.note(summaryLines.join('\n'), 'Installation Summary');
-
-  if (!options.yes) {
-    const confirmed = await p.confirm({ message: 'Proceed with installation?' });
-
-    if (p.isCancel(confirmed) || !confirmed) {
-      p.cancel('Installation cancelled');
-      process.exit(0);
-    }
-  }
 
   // Kick off privacy check early so it runs in parallel with installation
   const sourceIdentifier = wellKnownProvider.getSourceIdentifier(url);
@@ -892,6 +892,42 @@ async function handleWellKnownSkills(
   await promptForFindSkills(options, targetAgents);
 }
 
+/**
+ * Fetch a Notion page and write it to a temp directory as SKILL.md.
+ * Returns the temp directory path; the caller is responsible for cleanup.
+ */
+async function prepareNotionTempDir(
+  pageId: string,
+  spinner: ReturnType<typeof p.spinner>
+): Promise<string> {
+  const ntnAvailable = await isNtnInstalled();
+  if (!ntnAvailable) {
+    p.log.error('The ntn CLI is required to install skills from Notion pages.');
+    p.log.message(pc.dim('Install it with:'));
+    p.log.message(pc.cyan('  curl -fsSL https://ntn.dev | bash'));
+    process.exit(1);
+  }
+
+  spinner.start('Fetching Notion page...');
+  let markdown = '';
+  try {
+    markdown = await fetchNotionPageMarkdown(pageId);
+    spinner.stop('Notion page fetched');
+  } catch (err) {
+    spinner.stop(pc.red('Failed to fetch Notion page'));
+    const message = err instanceof Error ? err.message : String(err);
+    p.log.error(`Could not retrieve page ${pageId}: ${pc.dim(message)}`);
+    p.log.message(
+      pc.dim('Make sure you are authenticated (run ntn login) and have access to the page.')
+    );
+    process.exit(1);
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), 'skills-notion-'));
+  await writeFile(join(dir, 'SKILL.md'), markdown, 'utf-8');
+  return dir;
+}
+
 export async function runAdd(args: string[], options: AddOptions = {}): Promise<void> {
   const source = args[0];
   let installTipShown = false;
@@ -996,7 +1032,11 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
     let skills: Skill[];
     let blobResult: BlobInstallResult | null = null;
 
-    if (parsed.type === 'local') {
+    if (parsed.type === 'notion') {
+      tempDir = await prepareNotionTempDir(parsed.pageId!, spinner);
+      spinner.start('Discovering skills...');
+      skills = await discoverSkills(tempDir, undefined, { includeInternal });
+    } else if (parsed.type === 'local') {
       // Use local path directly, no cloning needed
       spinner.start('Validating local path...');
       if (!existsSync(parsed.localPath!)) {
@@ -1226,110 +1266,11 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
         )
       : Promise.resolve(null);
 
-    let targetAgents: AgentType[];
-    const validAgents = Object.keys(agents);
-
-    if (options.agent?.includes('*')) {
-      // --agent '*' selects all agents
-      targetAgents = validAgents as AgentType[];
-      p.log.info(`Installing to all ${targetAgents.length} agents`);
-    } else if (options.agent && options.agent.length > 0) {
-      const invalidAgents = options.agent.filter((a) => !validAgents.includes(a));
-
-      if (invalidAgents.length > 0) {
-        p.log.error(`Invalid agents: ${invalidAgents.join(', ')}`);
-        p.log.info(`Valid agents: ${validAgents.join(', ')}`);
-        await cleanup(tempDir);
-        process.exit(1);
-      }
-
-      targetAgents = options.agent as AgentType[];
-    } else {
-      spinner.start('Loading agents...');
-      const installedAgents = await detectInstalledAgents();
-      const totalAgents = Object.keys(agents).length;
-      spinner.stop(`${totalAgents} agents`);
-
-      if (installedAgents.length === 0) {
-        if (options.yes) {
-          targetAgents = validAgents as AgentType[];
-          p.log.info('Installing to all agents');
-        } else {
-          p.log.info('Select agents to install skills to');
-
-          const allAgentChoices = Object.entries(agents).map(([key, config]) => ({
-            value: key as AgentType,
-            label: config.displayName,
-          }));
-
-          // Use helper to prompt with search
-          const selected = await promptForAgents(
-            'Which agents do you want to install to?',
-            allAgentChoices
-          );
-
-          if (p.isCancel(selected)) {
-            p.cancel('Installation cancelled');
-            await cleanup(tempDir);
-            process.exit(0);
-          }
-
-          targetAgents = selected as AgentType[];
-        }
-      } else if (installedAgents.length === 1 || options.yes) {
-        // Auto-select detected agents + ensure universal agents are included
-        targetAgents = ensureUniversalAgents(installedAgents);
-        if (installedAgents.length === 1) {
-          const firstAgent = installedAgents[0]!;
-          p.log.info(`Installing to: ${pc.cyan(agents[firstAgent].displayName)}`);
-        } else {
-          p.log.info(
-            `Installing to: ${installedAgents.map((a) => pc.cyan(agents[a].displayName)).join(', ')}`
-          );
-        }
-      } else {
-        const selected = await selectAgentsInteractive({ global: options.global });
-
-        if (p.isCancel(selected)) {
-          p.cancel('Installation cancelled');
-          await cleanup(tempDir);
-          process.exit(0);
-        }
-
-        targetAgents = selected as AgentType[];
-      }
-    }
-
-    let installGlobally = options.global ?? false;
-
-    // Check if any selected agents support global installation
-    const supportsGlobal = targetAgents.some((a) => agents[a].globalSkillsDir !== undefined);
-
-    if (options.global === undefined && !options.yes && supportsGlobal) {
-      const scope = await p.select({
-        message: 'Installation scope',
-        options: [
-          {
-            value: false,
-            label: 'Project',
-            hint: 'Install in current directory (committed with your project)',
-          },
-          {
-            value: true,
-            label: 'Global',
-            hint: 'Install in home directory (available across all projects)',
-          },
-        ],
-      });
-
-      if (p.isCancel(scope)) {
-        p.cancel('Installation cancelled');
-        await cleanup(tempDir);
-        process.exit(0);
-      }
-
-      installGlobally = scope as boolean;
-    }
+    const { targetAgents, installGlobally } = await resolveAgentsAndScope(
+      options,
+      spinner,
+      async () => cleanup(tempDir)
+    );
 
     // Determine install mode (symlink vs copy)
     let installMode: InstallMode = options.copy ? 'copy' : 'symlink';
@@ -1466,16 +1407,6 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       }
     } catch {
       // Silently skip — security info is advisory only
-    }
-
-    if (!options.yes) {
-      const confirmed = await p.confirm({ message: 'Proceed with installation?' });
-
-      if (p.isCancel(confirmed) || !confirmed) {
-        p.cancel('Installation cancelled');
-        await cleanup(tempDir);
-        process.exit(0);
-      }
     }
 
     spinner.start('Installing skills...');
