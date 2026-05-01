@@ -723,15 +723,6 @@ async function handleWellKnownSkills(
   console.log();
   p.note(summaryLines.join('\n'), 'Installation Summary');
 
-  if (!options.yes) {
-    const confirmed = await p.confirm({ message: 'Proceed with installation?' });
-
-    if (p.isCancel(confirmed) || !confirmed) {
-      p.cancel('Installation cancelled');
-      process.exit(0);
-    }
-  }
-
   // Kick off privacy check early so it runs in parallel with installation
   const sourceIdentifier = wellKnownProvider.getSourceIdentifier(url);
   const wellKnownPrivacyPromise = isSourcePrivate(sourceIdentifier).catch(() => null);
@@ -1416,16 +1407,6 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       }
     } catch {
       // Silently skip — security info is advisory only
-    }
-
-    if (!options.yes) {
-      const confirmed = await p.confirm({ message: 'Proceed with installation?' });
-
-      if (p.isCancel(confirmed) || !confirmed) {
-        p.cancel('Installation cancelled');
-        await cleanup(tempDir);
-        process.exit(0);
-      }
     }
 
     spinner.start('Installing skills...');
