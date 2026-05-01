@@ -134,21 +134,24 @@ describe('source-parser', () => {
   describe('Notion page URLs', () => {
     const TEST_UUID = '353efdeead0580cc9ed9d3ee9b4357b5';
 
-    it('detects notion.so URLs', () => {
+    it('detects notion.so URLs with and without subdomains', () => {
+      expect(
+        isNotionUrl('https://notion.so/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
+      ).toBe(true);
       expect(
         isNotionUrl('https://www.notion.so/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
       ).toBe(true);
       expect(
-        isNotionUrl('https://notion.so/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
+        isNotionUrl('https://api.notion.so/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
       ).toBe(true);
     });
 
-    it('detects notion.com URLs', () => {
-      expect(
-        isNotionUrl('https://www.notion.com/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
-      ).toBe(true);
+    it('detects notion.com URLs with and without subdomains', () => {
       expect(
         isNotionUrl('https://notion.com/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
+      ).toBe(true);
+      expect(
+        isNotionUrl('https://www.notion.com/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
       ).toBe(true);
     });
 
