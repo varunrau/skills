@@ -907,17 +907,14 @@ async function handleNotionSkill(
   options: AddOptions,
   spinner: ReturnType<typeof p.spinner>
 ): Promise<void> {
-  spinner.start('Checking for ntn CLI...');
   const ntnAvailable = await isNtnInstalled();
   if (!ntnAvailable) {
-    spinner.stop(pc.red('ntn CLI not found'));
     p.log.error('The ntn CLI is required to install skills from Notion pages.');
     p.log.message(pc.dim('Install it with:'));
     p.log.message(pc.cyan('  curl -fsSL https://ntn.dev | bash'));
     p.outro(pc.red('Installation aborted'));
     process.exit(1);
   }
-  spinner.stop('ntn CLI found');
 
   spinner.start('Fetching Notion page...');
   let markdown = '';
