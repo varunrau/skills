@@ -1,5 +1,6 @@
 import { isAbsolute, resolve } from 'path';
 import type { ParsedSource } from './types.ts';
+import { isNotionUrl, extractNotionPageId } from './notion.ts';
 
 /**
  * Extract owner/repo (or group/subgroup/repo for GitLab) from a parsed source
@@ -369,6 +370,20 @@ export function parseSource(input: string): ParsedSource {
     };
   }
 
+  // Notion page URL: https://www.notion.so/... or https://www.notion.com/...
+  // Must be checked before the well-known fallback so Notion URLs don't get
+  // routed through the .well-known discovery mechanism.
+  if (isNotionUrl(input)) {
+    const pageId = extractNotionPageId(input);
+    if (pageId) {
+      return {
+        type: 'notion',
+        url: input,
+        pageId,
+      };
+    }
+  }
+
   // Well-known skills: arbitrary HTTP(S) URLs that aren't GitHub/GitLab
   // This is the final fallback for URLs - we'll check for /.well-known/agent-skills/index.json
   // then fall back to /.well-known/skills/index.json
@@ -400,8 +415,14 @@ function isWellKnownUrl(input: string): boolean {
   try {
     const parsed = new URL(input);
 
-    // Exclude known git hosts that have their own handling
-    const excludedHosts = ['github.com', 'gitlab.com', 'raw.githubusercontent.com'];
+    // Exclude known git hosts and Notion (has its own handler) that have their own handling
+    const excludedHosts = [
+      'github.com',
+      'gitlab.com',
+      'raw.githubusercontent.com',
+      'notion.so',
+      'notion.com',
+    ];
     if (excludedHosts.includes(parsed.hostname)) {
       return false;
     }

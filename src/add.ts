@@ -4,7 +4,8 @@ import { existsSync } from 'fs';
 import { homedir } from 'os';
 import { sep, join, dirname } from 'path';
 import { parseSource, getOwnerRepo, parseOwnerRepo, isRepoPrivate } from './source-parser.ts';
-import { stripTerminalEscapes } from './sanitize.ts';
+import { stripTerminalEscapes, sanitizeMetadata } from './sanitize.ts';
+import { parseFrontmatter } from './frontmatter.ts';
 import { searchMultiselect } from './prompts/search-multiselect.ts';
 
 // Helper to check if a value is a cancel symbol (works with both clack and our custom prompts)
@@ -30,6 +31,7 @@ import {
   isSkillInstalled,
   getCanonicalPath,
   installWellKnownSkillForAgent,
+  sanitizeName,
   type InstallMode,
 } from './installer.ts';
 import {
@@ -65,6 +67,7 @@ import {
   type BlobSkill,
   type BlobInstallResult,
 } from './blob.ts';
+import { isNtnInstalled, fetchNotionPageMarkdown } from './notion.ts';
 import packageJson from '../package.json' with { type: 'json' };
 export function initTelemetry(version: string): void {
   setVersion(version);
@@ -892,6 +895,282 @@ async function handleWellKnownSkills(
   await promptForFindSkills(options, targetAgents);
 }
 
+/**
+ * Handle skills sourced from a Notion page URL.
+ *
+ * Requires the `ntn` CLI to be installed. If it isn't, the user is directed
+ * to install it and the command aborts. Otherwise the page is fetched as
+ * Markdown, treated as a single SKILL.md, and installed using the standard
+ * well-known skill installation flow.
+ */
+async function handleNotionSkill(
+  source: string | undefined,
+  pageId: string,
+  options: AddOptions,
+  spinner: ReturnType<typeof p.spinner>
+): Promise<void> {
+  // ── 1. Check that the ntn CLI is available ────────────────────────────────
+  spinner.start('Checking for ntn CLI...');
+  const ntnAvailable = await isNtnInstalled();
+  if (!ntnAvailable) {
+    spinner.stop(pc.red('ntn CLI not found'));
+    p.log.error('The ntn CLI is required to install skills from Notion pages.');
+    p.log.message(pc.dim('Install it with:'));
+    p.log.message(pc.cyan('  curl -fsSL https://ntn.dev | bash'));
+    p.outro(pc.red('Installation aborted'));
+    process.exit(1);
+  }
+  spinner.stop('ntn CLI found');
+
+  // ── 2. Fetch the page content as Markdown ────────────────────────────────
+  spinner.start('Fetching Notion page...');
+  let markdown = '';
+  try {
+    markdown = await fetchNotionPageMarkdown(pageId);
+    spinner.stop('Notion page fetched');
+  } catch (err) {
+    spinner.stop(pc.red('Failed to fetch Notion page'));
+    const message = err instanceof Error ? err.message : String(err);
+    p.log.error(`Could not retrieve page ${pageId}: ${pc.dim(message)}`);
+    p.log.message(
+      pc.dim('Make sure you are authenticated (run ntn login) and have access to the page.')
+    );
+    p.outro(pc.red('Installation aborted'));
+    process.exit(1);
+  }
+
+  // ── 3. Parse frontmatter – normalise keys to lowercase ───────────────────
+  const { data: rawData } = parseFrontmatter(markdown);
+
+  // Notion exports field names with an initial capital (Name, Description).
+  // Normalise all keys to lowercase so we can look them up predictably.
+  const data: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(rawData)) {
+    data[key.toLowerCase()] = value;
+  }
+
+  const name =
+    typeof data.name === 'string' && data.name.trim() ? sanitizeMetadata(data.name) : null;
+  const description =
+    typeof data.description === 'string' && data.description.trim()
+      ? sanitizeMetadata(data.description)
+      : 'Skill imported from Notion';
+
+  if (!name) {
+    p.log.error(
+      'The Notion page does not contain a skill name in its frontmatter (expected a "name:" field).'
+    );
+    p.outro(pc.red('Installation aborted'));
+    process.exit(1);
+  }
+
+  // ── 4. Build a WellKnownSkill-compatible object ───────────────────────────
+  // If the frontmatter keys were capitalised, re-emit the content with
+  // lowercase keys so that other parts of the tool (e.g. parseSkillMd) can
+  // read the installed SKILL.md without special-casing.
+  let normalizedContent = markdown;
+  if (rawData.Name !== undefined || rawData.Description !== undefined) {
+    // Rewrite capitalised keys in the YAML front-matter block.
+    normalizedContent = markdown
+      .replace(/^Name:/m, 'name:')
+      .replace(/^Description:/m, 'description:');
+  }
+
+  // name is guaranteed non-null here (guarded above); cast to satisfy TS.
+  const installName = sanitizeName(name as string);
+
+  const skillFiles = new Map<string, string>();
+  skillFiles.set('SKILL.md', normalizedContent);
+
+  const skill = {
+    name: name as string, // guarded as non-null above
+    description,
+    content: normalizedContent,
+    installName,
+    sourceUrl: source ?? pageId,
+    files: skillFiles,
+    indexEntry: { name: installName, description, files: ['SKILL.md'] },
+  };
+
+  p.log.info(`Skill: ${pc.cyan(installName)}`);
+  p.log.message(pc.dim(description));
+
+  // ── 5. Agent & scope selection (reuse the well-known flow) ───────────────
+  let targetAgents: AgentType[];
+  const validAgents = Object.keys(agents);
+
+  if (options.agent?.includes('*')) {
+    targetAgents = validAgents as AgentType[];
+    p.log.info(`Installing to all ${targetAgents.length} agents`);
+  } else if (options.agent && options.agent.length > 0) {
+    const invalid = options.agent.filter((a) => !validAgents.includes(a));
+    if (invalid.length > 0) {
+      p.log.error(`Invalid agents: ${invalid.join(', ')}`);
+      p.log.info(`Valid agents: ${validAgents.join(', ')}`);
+      process.exit(1);
+    }
+    targetAgents = options.agent as AgentType[];
+  } else {
+    spinner.start('Loading agents...');
+    const installedAgents = await detectInstalledAgents();
+    const totalAgents = Object.keys(agents).length;
+    spinner.stop(`${totalAgents} agents`);
+
+    if (installedAgents.length === 0) {
+      if (options.yes) {
+        targetAgents = validAgents as AgentType[];
+        p.log.info('Installing to all agents');
+      } else {
+        const allAgentChoices = Object.entries(agents).map(([key, config]) => ({
+          value: key as AgentType,
+          label: config.displayName,
+        }));
+        const selected = await promptForAgents(
+          'Which agents do you want to install to?',
+          allAgentChoices
+        );
+        if (p.isCancel(selected)) {
+          p.cancel('Installation cancelled');
+          process.exit(0);
+        }
+        targetAgents = selected as AgentType[];
+      }
+    } else if (installedAgents.length === 1 || options.yes) {
+      targetAgents = ensureUniversalAgents(installedAgents);
+      const firstAgent = installedAgents[0]!;
+      p.log.info(`Installing to: ${pc.cyan(agents[firstAgent].displayName)}`);
+    } else {
+      const selected = await selectAgentsInteractive({ global: options.global });
+      if (p.isCancel(selected)) {
+        p.cancel('Installation cancelled');
+        process.exit(0);
+      }
+      targetAgents = selected as AgentType[];
+    }
+  }
+
+  let installGlobally = options.global ?? false;
+  const supportsGlobal = targetAgents.some((a) => agents[a].globalSkillsDir !== undefined);
+
+  if (options.global === undefined && !options.yes && supportsGlobal) {
+    const scope = await p.select({
+      message: 'Installation scope',
+      options: [
+        { value: false, label: 'Project', hint: 'Install in current directory' },
+        { value: true, label: 'Global', hint: 'Install in home directory (all projects)' },
+      ],
+    });
+    if (p.isCancel(scope)) {
+      p.cancel('Installation cancelled');
+      process.exit(0);
+    }
+    installGlobally = scope as boolean;
+  }
+
+  const installMode: InstallMode = 'copy'; // Notion skills are always copied (no canonical repo)
+
+  // ── 6. Summary & confirmation ─────────────────────────────────────────────
+  const cwd = process.cwd();
+  const canonicalPath = getCanonicalPath(installName, { global: installGlobally });
+  const shortCanonical = shortenPath(canonicalPath, cwd);
+
+  // Check which agents already have this skill installed (overwrite detection).
+  const overwriteChecks = await Promise.all(
+    targetAgents.map(async (agent) => ({
+      agent,
+      installed: await isSkillInstalled(installName, agent, { global: installGlobally }),
+    }))
+  );
+  const overwriteAgents = overwriteChecks
+    .filter((c) => c.installed)
+    .map((c) => agents[c.agent].displayName);
+  const isUpdate = overwriteAgents.length > 0;
+
+  const summaryLines = [
+    `${pc.cyan(shortCanonical)}`,
+    `  ${pc.dim('copy →')} ${targetAgents.map((a) => agents[a].displayName).join(', ')}`,
+  ];
+  if (isUpdate) {
+    summaryLines.push(`  ${pc.yellow('overwrites:')} ${formatList(overwriteAgents)}`);
+  }
+
+  console.log();
+  p.note(summaryLines.join('\n'), 'Installation Summary');
+
+  if (!options.yes) {
+    const confirmed = await p.confirm({ message: 'Proceed with installation?' });
+    if (p.isCancel(confirmed) || !confirmed) {
+      p.cancel('Installation cancelled');
+      process.exit(0);
+    }
+  }
+
+  // ── 7. Install ────────────────────────────────────────────────────────────
+  spinner.start(isUpdate ? 'Updating skill...' : 'Installing skill...');
+  const results: {
+    agent: string;
+    success: boolean;
+    path: string;
+    mode: InstallMode;
+    error?: string;
+  }[] = [];
+
+  for (const agent of targetAgents) {
+    const result = await installWellKnownSkillForAgent(skill, agent, {
+      global: installGlobally,
+      mode: installMode,
+    });
+    results.push({ agent: agents[agent].displayName, ...result });
+  }
+  spinner.stop(isUpdate ? 'Update complete' : 'Installation complete');
+
+  // ── 8. Results ────────────────────────────────────────────────────────────
+  console.log();
+  const successful = results.filter((r) => r.success);
+  const failed = results.filter((r) => !r.success);
+
+  if (successful.length > 0) {
+    const action = isUpdate ? 'updated' : 'copied';
+    const resultLines = [`${pc.green('✓')} ${installName} ${pc.dim(`(${action})`)}`];
+    for (const r of successful) {
+      resultLines.push(`  ${pc.dim('→')} ${shortenPath(r.path, cwd)}`);
+    }
+    const title = pc.green(isUpdate ? 'Updated 1 skill' : 'Installed 1 skill');
+    p.note(resultLines.join('\n'), title);
+  }
+
+  if (failed.length > 0) {
+    p.log.error(pc.red(`Failed to install ${failed.length}`));
+    for (const r of failed) {
+      p.log.message(`  ${pc.red('✗')} ${r.agent}: ${pc.dim(r.error ?? 'unknown error')}`);
+    }
+  }
+
+  // ── 9. Lock file ──────────────────────────────────────────────────────────
+  if (successful.length > 0 && installGlobally) {
+    try {
+      await addSkillToLock(installName, {
+        source: `notion/${pageId}`,
+        sourceType: 'notion' as 'well-known', // reuse well-known slot for lock compat
+        sourceUrl: source ?? pageId,
+        skillFolderHash: '',
+      });
+    } catch {
+      // Don't fail if lock update fails
+    }
+  }
+
+  console.log();
+  p.outro(
+    pc.green('Done!') +
+      pc.dim(
+        isUpdate
+          ? '  Skill updated from Notion.'
+          : '  Review skills before use; they run with full agent permissions.'
+      )
+  );
+}
+
 export async function runAdd(args: string[], options: AddOptions = {}): Promise<void> {
   const source = args[0];
   let installTipShown = false;
@@ -977,6 +1256,12 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
     // Handle well-known skills from arbitrary URLs
     if (parsed.type === 'well-known') {
       await handleWellKnownSkills(source, parsed.url, options, spinner);
+      return;
+    }
+
+    // Handle Notion page URLs
+    if (parsed.type === 'notion') {
+      await handleNotionSkill(source, parsed.pageId!, options, spinner);
       return;
     }
 
