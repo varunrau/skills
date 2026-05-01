@@ -146,15 +146,24 @@ describe('source-parser', () => {
       ).toBe(true);
     });
 
-    it('does not match notion.so/notion.com with a subdomain', () => {
+    it('detects www.notion.so URLs', () => {
       expect(
         isNotionUrl('https://www.notion.so/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
+      ).toBe(true);
+    });
+
+    it('detects app.notion.com URLs', () => {
+      expect(
+        isNotionUrl('https://app.notion.com/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
+      ).toBe(true);
+    });
+
+    it('does not match other notion subdomains', () => {
+      expect(
+        isNotionUrl('https://api.notion.so/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
       ).toBe(false);
       expect(
         isNotionUrl('https://www.notion.com/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
-      ).toBe(false);
-      expect(
-        isNotionUrl('https://api.notion.so/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
       ).toBe(false);
     });
 
@@ -223,6 +232,19 @@ describe('source-parser', () => {
 
     it('parseSource does NOT return well-known for notion.so URLs', () => {
       const url = `https://notion.so/notion/Page-${TEST_UUID}`;
+      const result = parseSource(url);
+      expect(result.type).not.toBe('well-known');
+    });
+
+    it('parseSource returns notion type for www.notion.so URL', () => {
+      const url = `https://www.notion.so/workspace/Page-${TEST_UUID}`;
+      const result = parseSource(url);
+      expect(result.type).toBe('notion');
+      expect(result).toHaveProperty('pageId', TEST_UUID);
+    });
+
+    it('parseSource does NOT return well-known for www.notion.so URLs', () => {
+      const url = `https://www.notion.so/workspace/Page-${TEST_UUID}`;
       const result = parseSource(url);
       expect(result.type).not.toBe('well-known');
     });

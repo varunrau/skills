@@ -15,8 +15,8 @@ const execFileAsync = promisify(execFile);
  * hyphen-separated slug, at the end of the URL path (before any query/fragment).
  * Notion also occasionally surfaces the dashed UUID format (8-4-4-4-12).
  */
-const UUID_HEX_RE = /([0-9a-f]{32})(?:[?#]|$)/i;
-const UUID_DASHED_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[?#]|$)/i;
+const UUID_HEX_RE = /([0-9a-f]{32})/i;
+const UUID_DASHED_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
 
 /**
  * Check whether a URL is a Notion page URL (notion.so or notion.com).
@@ -24,7 +24,12 @@ const UUID_DASHED_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 export function isNotionUrl(input: string): boolean {
   try {
     const { hostname } = new URL(input);
-    return hostname === 'notion.so' || hostname === 'notion.com';
+    return (
+      hostname === 'notion.so' ||
+      hostname === 'notion.com' ||
+      hostname === 'www.notion.so' ||
+      hostname === 'app.notion.com'
+    );
   } catch {
     return false;
   }

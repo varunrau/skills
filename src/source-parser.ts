@@ -422,6 +422,8 @@ function isWellKnownUrl(input: string): boolean {
       'raw.githubusercontent.com',
       'notion.so',
       'notion.com',
+      'www.notion.so',
+      'app.notion.com',
     ];
     if (excludedHosts.includes(parsed.hostname)) {
       return false;
