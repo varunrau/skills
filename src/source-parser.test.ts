@@ -134,25 +134,28 @@ describe('source-parser', () => {
   describe('Notion page URLs', () => {
     const TEST_UUID = '353efdeead0580cc9ed9d3ee9b4357b5';
 
-    it('detects notion.so URLs with and without subdomains', () => {
+    it('detects notion.so URLs', () => {
       expect(
         isNotionUrl('https://notion.so/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
       ).toBe(true);
-      expect(
-        isNotionUrl('https://www.notion.so/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
-      ).toBe(true);
-      expect(
-        isNotionUrl('https://api.notion.so/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
-      ).toBe(true);
     });
 
-    it('detects notion.com URLs with and without subdomains', () => {
+    it('detects notion.com URLs', () => {
       expect(
         isNotionUrl('https://notion.com/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
       ).toBe(true);
+    });
+
+    it('does not match notion.so/notion.com with a subdomain', () => {
+      expect(
+        isNotionUrl('https://www.notion.so/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
+      ).toBe(false);
       expect(
         isNotionUrl('https://www.notion.com/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
-      ).toBe(true);
+      ).toBe(false);
+      expect(
+        isNotionUrl('https://api.notion.so/workspace/Page-Title-353efdeead0580cc9ed9d3ee9b4357b5')
+      ).toBe(false);
     });
 
     it('does not match non-Notion URLs', () => {
@@ -162,24 +165,24 @@ describe('source-parser', () => {
     });
 
     it('extracts UUID from notion.so URL with slug', () => {
-      const url = `https://www.notion.so/notion/notion-cli-${TEST_UUID}?source=copy_link`;
+      const url = `https://notion.so/notion/notion-cli-${TEST_UUID}?source=copy_link`;
       expect(extractNotionPageId(url)).toBe(TEST_UUID);
     });
 
     it('extracts UUID from notion.com URL with slug', () => {
-      const url = `https://www.notion.com/workspace/My-Page-${TEST_UUID}`;
+      const url = `https://notion.com/workspace/My-Page-${TEST_UUID}`;
       expect(extractNotionPageId(url)).toBe(TEST_UUID);
     });
 
     it('extracts UUID from bare notion.so URL (no slug)', () => {
-      const url = `https://www.notion.so/${TEST_UUID}`;
+      const url = `https://notion.so/${TEST_UUID}`;
       expect(extractNotionPageId(url)).toBe(TEST_UUID);
     });
 
     it('extracts and normalises dashed UUID format', () => {
       // Standard 8-4-4-4-12 dashed UUID
       const dashedId = '353efde e-ad05-80e4-a2b3-ef639a09bffc'.replace(/ /g, '');
-      const url = `https://www.notion.so/workspace/${dashedId}`;
+      const url = `https://notion.so/workspace/${dashedId}`;
       const expected = dashedId.replace(/-/g, '').toLowerCase();
       expect(extractNotionPageId(url)).toBe(expected);
     });
@@ -195,8 +198,8 @@ describe('source-parser', () => {
     });
 
     it('returns null for Notion URL without a UUID', () => {
-      expect(extractNotionPageId('https://www.notion.so/workspace/no-uuid-here')).toBeNull();
-      expect(extractNotionPageId('https://www.notion.so/')).toBeNull();
+      expect(extractNotionPageId('https://notion.so/workspace/no-uuid-here')).toBeNull();
+      expect(extractNotionPageId('https://notion.so/')).toBeNull();
     });
 
     it('returns null for non-Notion URLs', () => {
@@ -204,7 +207,7 @@ describe('source-parser', () => {
     });
 
     it('parseSource returns notion type for notion.so URL', () => {
-      const url = `https://www.notion.so/notion/notion-cli-${TEST_UUID}?source=copy_link`;
+      const url = `https://notion.so/notion/notion-cli-${TEST_UUID}?source=copy_link`;
       const result = parseSource(url);
       expect(result.type).toBe('notion');
       expect(result.url).toBe(url);
@@ -219,7 +222,7 @@ describe('source-parser', () => {
     });
 
     it('parseSource does NOT return well-known for notion.so URLs', () => {
-      const url = `https://www.notion.so/notion/Page-${TEST_UUID}`;
+      const url = `https://notion.so/notion/Page-${TEST_UUID}`;
       const result = parseSource(url);
       expect(result.type).not.toBe('well-known');
     });

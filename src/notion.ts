@@ -25,12 +25,7 @@ const UUID_DASHED_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 export function isNotionUrl(input: string): boolean {
   try {
     const { hostname } = new URL(input);
-    return (
-      hostname === 'notion.so' ||
-      hostname === 'notion.com' ||
-      hostname.endsWith('.notion.so') ||
-      hostname.endsWith('.notion.com')
-    );
+    return hostname === 'notion.so' || hostname === 'notion.com';
   } catch {
     return false;
   }
