@@ -912,7 +912,6 @@ async function handleNotionSkill(
     p.log.error('The ntn CLI is required to install skills from Notion pages.');
     p.log.message(pc.dim('Install it with:'));
     p.log.message(pc.cyan('  curl -fsSL https://ntn.dev | bash'));
-    p.outro(pc.red('Installation aborted'));
     process.exit(1);
   }
 
@@ -928,7 +927,6 @@ async function handleNotionSkill(
     p.log.message(
       pc.dim('Make sure you are authenticated (run ntn login) and have access to the page.')
     );
-    p.outro(pc.red('Installation aborted'));
     process.exit(1);
   }
 
@@ -949,7 +947,6 @@ async function handleNotionSkill(
     p.log.error(
       'The Notion page could not be parsed as a skill. Make sure it has a valid frontmatter with "name" and "description" fields.'
     );
-    p.outro(pc.red('Installation aborted'));
     process.exit(1);
   }
 
