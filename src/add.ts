@@ -4,8 +4,7 @@ import { existsSync } from 'fs';
 import { homedir } from 'os';
 import { sep, join, dirname } from 'path';
 import { parseSource, getOwnerRepo, parseOwnerRepo, isRepoPrivate } from './source-parser.ts';
-import { stripTerminalEscapes, sanitizeMetadata } from './sanitize.ts';
-import { parseFrontmatter } from './frontmatter.ts';
+import { stripTerminalEscapes } from './sanitize.ts';
 import { searchMultiselect } from './prompts/search-multiselect.ts';
 
 // Helper to check if a value is a cancel symbol (works with both clack and our custom prompts)
@@ -24,7 +23,7 @@ async function isSourcePrivate(source: string): Promise<boolean | null> {
   return isRepoPrivate(ownerRepo.owner, ownerRepo.repo);
 }
 import { cloneRepo, cleanupTempDir, GitCloneError } from './git.ts';
-import { discoverSkills, getSkillDisplayName, filterSkills } from './skills.ts';
+import { discoverSkills, getSkillDisplayName, filterSkills, parseSkillMd } from './skills.ts';
 import {
   installSkillForAgent,
   installBlobSkillForAgent,
@@ -898,10 +897,10 @@ async function handleWellKnownSkills(
 /**
  * Handle skills sourced from a Notion page URL.
  *
- * Requires the `ntn` CLI to be installed. If it isn't, the user is directed
- * to install it and the command aborts. Otherwise the page is fetched as
- * Markdown, treated as a single SKILL.md, and installed using the standard
- * well-known skill installation flow.
+ * Requires the `ntn` CLI to be installed. The page is fetched as Markdown,
+ * written to a temporary directory as SKILL.md, then installed using the
+ * same disk-based path as local and git sources — no custom frontmatter
+ * parsing needed.
  */
 async function handleNotionSkill(
   source: string | undefined,
@@ -939,63 +938,34 @@ async function handleNotionSkill(
     process.exit(1);
   }
 
-  // ── 3. Parse frontmatter – normalise keys to lowercase ───────────────────
-  const { data: rawData } = parseFrontmatter(markdown);
+  // ── 3. Write to a temp dir and parse via existing skill machinery ─────────
+  // parseFrontmatter normalises YAML keys to lowercase, so Notion's "Name:"
+  // and "Description:" are handled automatically by parseSkillMd.
+  const { mkdtemp, writeFile: fsWriteFile, rm: fsRm } = await import('fs/promises');
+  const { join: pathJoin } = await import('path');
+  const { tmpdir } = await import('os');
 
-  // Notion exports field names with an initial capital (Name, Description).
-  // Normalise all keys to lowercase so we can look them up predictably.
-  const data: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(rawData)) {
-    data[key.toLowerCase()] = value;
+  const tempDir = await mkdtemp(pathJoin(tmpdir(), 'skills-notion-'));
+  let skill: Skill | null = null;
+  try {
+    await fsWriteFile(pathJoin(tempDir, 'SKILL.md'), markdown, 'utf-8');
+    skill = await parseSkillMd(pathJoin(tempDir, 'SKILL.md'));
+  } finally {
+    await fsRm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
 
-  const name =
-    typeof data.name === 'string' && data.name.trim() ? sanitizeMetadata(data.name) : null;
-  const description =
-    typeof data.description === 'string' && data.description.trim()
-      ? sanitizeMetadata(data.description)
-      : 'Skill imported from Notion';
-
-  if (!name) {
+  if (!skill) {
     p.log.error(
-      'The Notion page does not contain a skill name in its frontmatter (expected a "name:" field).'
+      'The Notion page could not be parsed as a skill. Make sure it has a valid frontmatter with "name" and "description" fields.'
     );
     p.outro(pc.red('Installation aborted'));
     process.exit(1);
   }
 
-  // ── 4. Build a WellKnownSkill-compatible object ───────────────────────────
-  // If the frontmatter keys were capitalised, re-emit the content with
-  // lowercase keys so that other parts of the tool (e.g. parseSkillMd) can
-  // read the installed SKILL.md without special-casing.
-  let normalizedContent = markdown;
-  if (rawData.Name !== undefined || rawData.Description !== undefined) {
-    // Rewrite capitalised keys in the YAML front-matter block.
-    normalizedContent = markdown
-      .replace(/^Name:/m, 'name:')
-      .replace(/^Description:/m, 'description:');
-  }
+  p.log.info(`Skill: ${pc.cyan(skill.name)}`);
+  p.log.message(pc.dim(skill.description));
 
-  // name is guaranteed non-null here (guarded above); cast to satisfy TS.
-  const installName = sanitizeName(name as string);
-
-  const skillFiles = new Map<string, string>();
-  skillFiles.set('SKILL.md', normalizedContent);
-
-  const skill = {
-    name: name as string, // guarded as non-null above
-    description,
-    content: normalizedContent,
-    installName,
-    sourceUrl: source ?? pageId,
-    files: skillFiles,
-    indexEntry: { name: installName, description, files: ['SKILL.md'] },
-  };
-
-  p.log.info(`Skill: ${pc.cyan(installName)}`);
-  p.log.message(pc.dim(description));
-
-  // ── 5. Agent & scope selection (reuse the well-known flow) ───────────────
+  // ── 4. Agent & scope selection ────────────────────────────────────────────
   let targetAgents: AgentType[];
   const validAgents = Object.keys(agents);
 
@@ -1069,16 +1039,15 @@ async function handleNotionSkill(
 
   const installMode: InstallMode = 'copy'; // Notion skills are always copied (no canonical repo)
 
-  // ── 6. Summary & confirmation ─────────────────────────────────────────────
+  // ── 5. Summary & confirmation ─────────────────────────────────────────────
   const cwd = process.cwd();
-  const canonicalPath = getCanonicalPath(installName, { global: installGlobally });
+  const canonicalPath = getCanonicalPath(skill.name, { global: installGlobally });
   const shortCanonical = shortenPath(canonicalPath, cwd);
 
-  // Check which agents already have this skill installed (overwrite detection).
   const overwriteChecks = await Promise.all(
     targetAgents.map(async (agent) => ({
       agent,
-      installed: await isSkillInstalled(installName, agent, { global: installGlobally }),
+      installed: await isSkillInstalled(skill!.name, agent, { global: installGlobally }),
     }))
   );
   const overwriteAgents = overwriteChecks
@@ -1105,59 +1074,71 @@ async function handleNotionSkill(
     }
   }
 
-  // ── 7. Install ────────────────────────────────────────────────────────────
-  spinner.start(isUpdate ? 'Updating skill...' : 'Installing skill...');
-  const results: {
-    agent: string;
-    success: boolean;
-    path: string;
-    mode: InstallMode;
-    error?: string;
-  }[] = [];
+  // ── 6. Write markdown to a fresh temp dir for installation ────────────────
+  // The first temp dir was cleaned up after parsing. We need a second one
+  // because installSkillForAgent reads files from disk.
+  const installTempDir = await mkdtemp(pathJoin(tmpdir(), 'skills-notion-'));
+  try {
+    await fsWriteFile(pathJoin(installTempDir, 'SKILL.md'), markdown, 'utf-8');
+    const diskSkill: Skill = { ...skill, path: installTempDir };
 
-  for (const agent of targetAgents) {
-    const result = await installWellKnownSkillForAgent(skill, agent, {
-      global: installGlobally,
-      mode: installMode,
-    });
-    results.push({ agent: agents[agent].displayName, ...result });
-  }
-  spinner.stop(isUpdate ? 'Update complete' : 'Installation complete');
+    // ── 7. Install ──────────────────────────────────────────────────────────
+    spinner.start(isUpdate ? 'Updating skill...' : 'Installing skill...');
+    const results: {
+      agent: string;
+      success: boolean;
+      path: string;
+      canonicalPath?: string;
+      mode: InstallMode;
+      symlinkFailed?: boolean;
+      error?: string;
+    }[] = [];
 
-  // ── 8. Results ────────────────────────────────────────────────────────────
-  console.log();
-  const successful = results.filter((r) => r.success);
-  const failed = results.filter((r) => !r.success);
-
-  if (successful.length > 0) {
-    const action = isUpdate ? 'updated' : 'copied';
-    const resultLines = [`${pc.green('✓')} ${installName} ${pc.dim(`(${action})`)}`];
-    for (const r of successful) {
-      resultLines.push(`  ${pc.dim('→')} ${shortenPath(r.path, cwd)}`);
-    }
-    const title = pc.green(isUpdate ? 'Updated 1 skill' : 'Installed 1 skill');
-    p.note(resultLines.join('\n'), title);
-  }
-
-  if (failed.length > 0) {
-    p.log.error(pc.red(`Failed to install ${failed.length}`));
-    for (const r of failed) {
-      p.log.message(`  ${pc.red('✗')} ${r.agent}: ${pc.dim(r.error ?? 'unknown error')}`);
-    }
-  }
-
-  // ── 9. Lock file ──────────────────────────────────────────────────────────
-  if (successful.length > 0 && installGlobally) {
-    try {
-      await addSkillToLock(installName, {
-        source: `notion/${pageId}`,
-        sourceType: 'notion' as 'well-known', // reuse well-known slot for lock compat
-        sourceUrl: source ?? pageId,
-        skillFolderHash: '',
+    for (const agent of targetAgents) {
+      const result = await installSkillForAgent(diskSkill, agent, {
+        global: installGlobally,
+        mode: installMode,
       });
-    } catch {
-      // Don't fail if lock update fails
+      results.push({ agent: agents[agent].displayName, ...result });
     }
+    spinner.stop(isUpdate ? 'Update complete' : 'Installation complete');
+
+    // ── 8. Results ────────────────────────────────────────────────────────
+    console.log();
+    const successful = results.filter((r) => r.success);
+    const failed = results.filter((r) => !r.success);
+
+    if (successful.length > 0) {
+      const action = isUpdate ? 'updated' : 'copied';
+      const resultLines = [`${pc.green('✓')} ${skill.name} ${pc.dim(`(${action})`)}`];
+      for (const r of successful) {
+        resultLines.push(`  ${pc.dim('→')} ${shortenPath(r.path, cwd)}`);
+      }
+      p.note(resultLines.join('\n'), pc.green(isUpdate ? 'Updated 1 skill' : 'Installed 1 skill'));
+    }
+
+    if (failed.length > 0) {
+      p.log.error(pc.red(`Failed to install ${failed.length}`));
+      for (const r of failed) {
+        p.log.message(`  ${pc.red('✗')} ${r.agent}: ${pc.dim(r.error ?? 'unknown error')}`);
+      }
+    }
+
+    // ── 9. Lock file ────────────────────────────────────────────────────────
+    if (successful.length > 0 && installGlobally) {
+      try {
+        await addSkillToLock(skill.name, {
+          source: `notion/${pageId}`,
+          sourceType: 'notion' as 'well-known',
+          sourceUrl: source ?? pageId,
+          skillFolderHash: '',
+        });
+      } catch {
+        // Don't fail if lock update fails
+      }
+    }
+  } finally {
+    await fsRm(installTempDir, { recursive: true, force: true }).catch(() => {});
   }
 
   console.log();
@@ -1170,7 +1151,6 @@ async function handleNotionSkill(
       )
   );
 }
-
 export async function runAdd(args: string[], options: AddOptions = {}): Promise<void> {
   const source = args[0];
   let installTipShown = false;
