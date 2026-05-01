@@ -1,8 +1,9 @@
 import * as p from '@clack/prompts';
 import pc from 'picocolors';
 import { existsSync } from 'fs';
-import { homedir } from 'os';
+import { homedir, tmpdir } from 'os';
 import { sep, join, dirname } from 'path';
+import { mkdtemp, writeFile } from 'fs/promises';
 import { parseSource, getOwnerRepo, parseOwnerRepo, isRepoPrivate } from './source-parser.ts';
 import { stripTerminalEscapes } from './sanitize.ts';
 import { searchMultiselect } from './prompts/search-multiselect.ts';
@@ -901,18 +902,13 @@ async function handleWellKnownSkills(
 }
 
 /**
- * Handle skills sourced from a Notion page URL.
- *
- * Requires the `ntn` CLI to be installed. The page is fetched as Markdown,
- * written to a temporary directory as SKILL.md, then installed using the
- * same disk-based path as local and git sources.
+ * Fetch a Notion page and write it to a temp directory as SKILL.md.
+ * Returns the temp directory path; the caller is responsible for cleanup.
  */
-async function handleNotionSkill(
-  source: string | undefined,
+async function prepareNotionTempDir(
   pageId: string,
-  options: AddOptions,
   spinner: ReturnType<typeof p.spinner>
-): Promise<void> {
+): Promise<string> {
   const ntnAvailable = await isNtnInstalled();
   if (!ntnAvailable) {
     p.log.error('The ntn CLI is required to install skills from Notion pages.');
@@ -936,130 +932,11 @@ async function handleNotionSkill(
     process.exit(1);
   }
 
-  const { mkdtemp, writeFile: fsWriteFile, rm: fsRm } = await import('fs/promises');
-  const { join: pathJoin } = await import('path');
-  const { tmpdir } = await import('os');
-
-  const tempDir = await mkdtemp(pathJoin(tmpdir(), 'skills-notion-'));
-  let skill: Skill | null = null;
-  try {
-    await fsWriteFile(pathJoin(tempDir, 'SKILL.md'), markdown, 'utf-8');
-    skill = await parseSkillMd(pathJoin(tempDir, 'SKILL.md'));
-  } finally {
-    await fsRm(tempDir, { recursive: true, force: true }).catch(() => {});
-  }
-
-  if (!skill) {
-    p.log.error(
-      'The Notion page could not be parsed as a skill. Make sure it has a valid frontmatter with "name" and "description" fields.'
-    );
-    process.exit(1);
-  }
-
-  p.log.info(`Skill: ${pc.cyan(skill.name)}`);
-  p.log.message(pc.dim(skill.description));
-
-  const { targetAgents, installGlobally } = await resolveAgentsAndScope(options, spinner);
-
-  const installMode: InstallMode = 'copy';
-
-  const cwd = process.cwd();
-  const canonicalPath = getCanonicalPath(skill.name, { global: installGlobally });
-  const shortCanonical = shortenPath(canonicalPath, cwd);
-
-  const overwriteChecks = await Promise.all(
-    targetAgents.map(async (agent) => ({
-      agent,
-      installed: await isSkillInstalled(skill!.name, agent, { global: installGlobally }),
-    }))
-  );
-  const overwriteAgents = overwriteChecks
-    .filter((c) => c.installed)
-    .map((c) => agents[c.agent].displayName);
-  const isUpdate = overwriteAgents.length > 0;
-
-  const summaryLines = [
-    `${pc.cyan(shortCanonical)}`,
-    `  ${pc.dim('copy →')} ${targetAgents.map((a) => agents[a].displayName).join(', ')}`,
-  ];
-  if (isUpdate) {
-    summaryLines.push(`  ${pc.yellow('overwrites:')} ${formatList(overwriteAgents)}`);
-  }
-
-  console.log();
-  p.note(summaryLines.join('\n'), 'Installation Summary');
-
-  const installTempDir = await mkdtemp(pathJoin(tmpdir(), 'skills-notion-'));
-  try {
-    await fsWriteFile(pathJoin(installTempDir, 'SKILL.md'), markdown, 'utf-8');
-    const diskSkill: Skill = { ...skill, path: installTempDir };
-
-    spinner.start(isUpdate ? 'Updating skill...' : 'Installing skill...');
-    const results: {
-      agent: string;
-      success: boolean;
-      path: string;
-      canonicalPath?: string;
-      mode: InstallMode;
-      symlinkFailed?: boolean;
-      error?: string;
-    }[] = [];
-
-    for (const agent of targetAgents) {
-      const result = await installSkillForAgent(diskSkill, agent, {
-        global: installGlobally,
-        mode: installMode,
-      });
-      results.push({ agent: agents[agent].displayName, ...result });
-    }
-    spinner.stop(isUpdate ? 'Update complete' : 'Installation complete');
-
-    console.log();
-    const successful = results.filter((r) => r.success);
-    const failed = results.filter((r) => !r.success);
-
-    if (successful.length > 0) {
-      const action = isUpdate ? 'updated' : 'copied';
-      const resultLines = [`${pc.green('✓')} ${skill.name} ${pc.dim(`(${action})`)}`];
-      for (const r of successful) {
-        resultLines.push(`  ${pc.dim('→')} ${shortenPath(r.path, cwd)}`);
-      }
-      p.note(resultLines.join('\n'), pc.green(isUpdate ? 'Updated 1 skill' : 'Installed 1 skill'));
-    }
-
-    if (failed.length > 0) {
-      p.log.error(pc.red(`Failed to install ${failed.length}`));
-      for (const r of failed) {
-        p.log.message(`  ${pc.red('✗')} ${r.agent}: ${pc.dim(r.error ?? 'unknown error')}`);
-      }
-    }
-
-    if (successful.length > 0 && installGlobally) {
-      try {
-        await addSkillToLock(skill.name, {
-          source: `notion/${pageId}`,
-          sourceType: 'notion' as 'well-known',
-          sourceUrl: source ?? pageId,
-          skillFolderHash: '',
-        });
-      } catch {
-        // Don't fail if lock update fails
-      }
-    }
-  } finally {
-    await fsRm(installTempDir, { recursive: true, force: true }).catch(() => {});
-  }
-
-  console.log();
-  p.outro(
-    pc.green('Done!') +
-      pc.dim(
-        isUpdate
-          ? '  Skill updated from Notion.'
-          : '  Review skills before use; they run with full agent permissions.'
-      )
-  );
+  const dir = await mkdtemp(join(tmpdir(), 'skills-notion-'));
+  await writeFile(join(dir, 'SKILL.md'), markdown, 'utf-8');
+  return dir;
 }
+
 export async function runAdd(args: string[], options: AddOptions = {}): Promise<void> {
   const source = args[0];
   let installTipShown = false;
@@ -1148,12 +1025,6 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       return;
     }
 
-    // Handle Notion page URLs
-    if (parsed.type === 'notion') {
-      await handleNotionSkill(source, parsed.pageId!, options, spinner);
-      return;
-    }
-
     // If skillFilter is present from @skill syntax (e.g., owner/repo@skill-name),
     // merge it into options.skill
     if (parsed.skillFilter) {
@@ -1170,7 +1041,11 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
     let skills: Skill[];
     let blobResult: BlobInstallResult | null = null;
 
-    if (parsed.type === 'local') {
+    if (parsed.type === 'notion') {
+      tempDir = await prepareNotionTempDir(parsed.pageId!, spinner);
+      spinner.start('Discovering skills...');
+      skills = await discoverSkills(tempDir, undefined, { includeInternal });
+    } else if (parsed.type === 'local') {
       // Use local path directly, no cloning needed
       spinner.start('Validating local path...');
       if (!existsSync(parsed.localPath!)) {
