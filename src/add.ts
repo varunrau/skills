@@ -989,14 +989,6 @@ async function handleNotionSkill(
   console.log();
   p.note(summaryLines.join('\n'), 'Installation Summary');
 
-  if (!options.yes) {
-    const confirmed = await p.confirm({ message: 'Proceed with installation?' });
-    if (p.isCancel(confirmed) || !confirmed) {
-      p.cancel('Installation cancelled');
-      process.exit(0);
-    }
-  }
-
   const installTempDir = await mkdtemp(pathJoin(tmpdir(), 'skills-notion-'));
   try {
     await fsWriteFile(pathJoin(installTempDir, 'SKILL.md'), markdown, 'utf-8');
